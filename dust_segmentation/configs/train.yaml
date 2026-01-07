@@ -1,0 +1,28 @@
+experiment:
+  name: "vgg19_unet_sdust"
+  seed: 42
+
+data:
+  root: "dust_segmentation/data/S-dust"
+  train_images: "train_valid/images"
+  train_masks: "train_valid/masks"
+  test_images: "test/images"
+  test_masks: "test/masks"
+  splits_dir: "splits"
+  image_size: [512, 512]
+  batch_size: 4
+  shuffle_buffer: 200
+  num_classes: 1
+  augment:
+    random_flip: true
+    random_rotation: false
+
+training:
+  lr: 1e-5
+  epochs: 50
+  optimizer: "adam"
+  checkpoint_monitor: "val_loss"
+  threshold: 0.5
+
+evaluation:
+  threshold: 0.5
