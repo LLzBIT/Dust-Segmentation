@@ -1,5 +1,5 @@
-import tensorflow as tf
+import torch
 
 
 def binary_crossentropy():
-    return tf.keras.losses.BinaryCrossentropy()
+    return torch.nn.BCELoss()

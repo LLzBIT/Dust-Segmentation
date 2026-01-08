@@ -3,10 +3,10 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
-import tensorflow as tf
 import yaml
+import torch
 
-from dust_segmentation.src.datasets.sdust_dataset import DatasetConfig, create_datasets
+from dust_segmentation.src.datasets.sdust_datasets import DatasetConfig, create_datasets
 from dust_segmentation.src.losses.bce import binary_crossentropy
 from dust_segmentation.src.models.vgg_unet import build_vgg19_unet
 from dust_segmentation.src.utils.seed import set_seed
@@ -26,9 +26,9 @@ def _create_run_dir(base_dir: Path, name: str) -> Path:
     return run_dir
 
 
-def _create_optimizer(name: str, lr: float) -> tf.keras.optimizers.Optimizer:
+def _create_optimizer(name: str, lr: float, parameters) -> torch.optim.Optimizer:
     if name.lower() == "adam":
-        return tf.keras.optimizers.Adam(learning_rate=lr)
+        return torch.optim.Adam(parameters, lr=lr)
     raise ValueError(f"Unsupported optimizer: {name}")
 
 
@@ -54,35 +54,62 @@ def train(config_path: Path) -> Path:
     set_seed(config["experiment"]["seed"])
 
     dataset_config = _build_dataset_config(config)
-    train_ds, val_ds, _ = create_datasets(dataset_config)
+    train_loader, val_loader, _ = create_datasets(dataset_config)
 
     input_shape = (*dataset_config.image_size, 3)
     model = build_vgg19_unet(input_shape, dataset_config.num_classes)
-
-    optimizer = _create_optimizer(config["training"]["optimizer"], config["training"]["lr"])
-    model.compile(optimizer=optimizer, loss=binary_crossentropy())
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    optimizer = _create_optimizer(config["training"]["optimizer"], config["training"]["lr"], model.parameters())
+    criterion = binary_crossentropy()
 
     run_dir = _create_run_dir(Path("dust_segmentation/outputs/runs"), config["experiment"]["name"])
     log_path = run_dir / "logs.csv"
-    callbacks = [
-        tf.keras.callbacks.CSVLogger(str(log_path)),
-        tf.keras.callbacks.ModelCheckpoint(
-            filepath=str(run_dir / "checkpoints" / "best.weights.h5"),
-            monitor=config["training"]["checkpoint_monitor"],
-            save_best_only=True,
-            save_weights_only=True,
-        ),
-    ]
+    history = {"loss": [], "val_loss": []}
+    best_val_loss = float("inf")
 
-    history = model.fit(
-        train_ds,
-        validation_data=val_ds,
-        epochs=config["training"]["epochs"],
-        callbacks=callbacks,
-    )
+    with log_path.open("w", encoding="utf-8") as log_handle:
+        log_handle.write("epoch,loss,val_loss\n")
+
+    for epoch in range(config["training"]["epochs"]):
+        model.train()
+        running_loss = 0.0
+        for images, masks in train_loader:
+            images = images.to(device)
+            masks = masks.to(device)
+            optimizer.zero_grad()
+            outputs = model(images)
+            loss = criterion(outputs, masks)
+            loss.backward()
+            optimizer.step()
+            running_loss += loss.item() * images.size(0)
+
+        train_loss = running_loss / len(train_loader.dataset)
+
+        model.eval()
+        val_running_loss = 0.0
+        with torch.no_grad():
+            for images, masks in val_loader:
+                images = images.to(device)
+                masks = masks.to(device)
+                outputs = model(images)
+                loss = criterion(outputs, masks)
+                val_running_loss += loss.item() * images.size(0)
+
+        val_loss = val_running_loss / len(val_loader.dataset)
+
+        history["loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+
+        with log_path.open("a", encoding="utf-8") as log_handle:
+            log_handle.write(f"{epoch + 1},{train_loss:.6f},{val_loss:.6f}\n")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), run_dir / "checkpoints" / "best.weights.pt")
 
     with (run_dir / "history.json").open("w", encoding="utf-8") as handle:
-        json.dump(history.history, handle, indent=2)
+        json.dump(history, handle, indent=2)
 
     return run_dir
 

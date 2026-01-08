@@ -3,10 +3,10 @@ from pathlib import Path
 from typing import Any, Dict
 
 import numpy as np
-import tensorflow as tf
+import torch
 import yaml
 
-from dust_segmentation.src.datasets.sdust_dataset import DatasetConfig, create_datasets, load_test_filenames
+from dust_segmentation.src.datasets.sdust_datasets import DatasetConfig, create_datasets, load_test_filenames
 from dust_segmentation.src.metrics.segmentation_metrics import compute_segmentation_metrics
 from dust_segmentation.src.models.vgg_unet import build_vgg19_unet
 from dust_segmentation.src.utils.seed import set_seed
@@ -42,21 +42,33 @@ def evaluate(config_path: Path, weights_path: Path, run_dir: Path) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
 
     dataset_config = _build_dataset_config(config)
-    _, _, test_ds = create_datasets(dataset_config)
+    _, _, test_loader = create_datasets(dataset_config)
 
     input_shape = (*dataset_config.image_size, 3)
     model = build_vgg19_unet(input_shape, dataset_config.num_classes)
-    model.load_weights(weights_path)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    model.load_state_dict(torch.load(weights_path, map_location=device))
+    model.eval()
 
     threshold = config["evaluation"]["threshold"]
 
-    predictions = model.predict(test_ds)
-    predicted_masks = (predictions >= threshold).astype(np.uint8)
+    predictions = []
+    y_true = []
+    with torch.no_grad():
+        for images, masks in test_loader:
+            images = images.to(device)
+            outputs = model(images).cpu().numpy()
+            predictions.append(outputs)
+            y_true.append(masks.numpy())
 
-    y_true = np.concatenate([y.numpy() for _, y in test_ds], axis=0)
+    predictions_array = np.concatenate(predictions, axis=0)
+    predicted_masks = (predictions_array >= threshold).astype(np.uint8)
+
+    y_true_array = np.concatenate(y_true, axis=0)
     y_pred = predicted_masks
 
-    metrics = compute_segmentation_metrics(y_true, y_pred)
+    metrics = compute_segmentation_metrics(y_true_array, y_pred)
 
     metrics_path = run_dir / "metrics.json"
     with metrics_path.open("w", encoding="utf-8") as handle:
@@ -69,6 +81,6 @@ def evaluate(config_path: Path, weights_path: Path, run_dir: Path) -> None:
 if __name__ == "__main__":
     evaluate(
         Path("dust_segmentation/configs/train.yaml"),
-        Path("dust_segmentation/outputs/runs/latest/checkpoints/best.weights.h5"),
+        Path("dust_segmentation/outputs/runs/latest/checkpoints/best.weights.pt"),
         Path("dust_segmentation/outputs/runs/latest"),
     )
