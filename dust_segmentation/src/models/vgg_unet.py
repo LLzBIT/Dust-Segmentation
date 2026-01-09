@@ -1,52 +1,76 @@
-import tensorflow as tf
+from typing import Tuple
+
+import torch
+from torch import nn
+from torchvision.models import VGG19_Weights, vgg19
 
 
-def conv_block(inputs, num_filters):
-    x = tf.keras.layers.Conv2D(num_filters, 3, padding="same")(inputs)
-    x = tf.keras.layers.BatchNormalization()(x)
-    x = tf.keras.layers.Activation("relu")(x)
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+        )
 
-    x = tf.keras.layers.Conv2D(num_filters, 3, padding="same")(x)
-    x = tf.keras.layers.BatchNormalization()(x)
-    x = tf.keras.layers.Activation("relu")(x)
-
-    return x
-
-
-def decoder_block(inputs, skip_features, num_filters):
-    x = tf.keras.layers.Conv2DTranspose(num_filters, (2, 2), strides=2, padding="same")(inputs)
-    x = tf.keras.layers.Concatenate()([x, skip_features])
-    x = conv_block(x, num_filters)
-    return x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
 
 
-def build_vgg19_unet(input_shape, num_classes):
-    inputs = tf.keras.layers.Input(input_shape)
+class DecoderBlock(nn.Module):
+    def __init__(self, in_channels: int, skip_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+        self.conv = ConvBlock(out_channels + skip_channels, out_channels)
 
-    vgg19 = tf.keras.applications.VGG19(
-        include_top=False,
-        weights="imagenet",
-        input_tensor=inputs,
-    )
-    vgg19.trainable = True
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
+        x = self.up(x)
+        x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
 
-    s1 = vgg19.get_layer("block1_conv2").output
-    s2 = vgg19.get_layer("block2_conv2").output
-    s3 = vgg19.get_layer("block3_conv4").output
-    s4 = vgg19.get_layer("block4_conv4").output
 
-    b1 = vgg19.get_layer("block5_conv4").output
+class VGG19UNet(nn.Module):
+    def __init__(self, num_classes: int) -> None:
+        super().__init__()
+        backbone = vgg19(weights=VGG19_Weights.IMAGENET1K_V1)
+        self.encoder = backbone.features
 
-    d1 = decoder_block(b1, s4, 512)
-    d2 = decoder_block(d1, s3, 256)
-    d3 = decoder_block(d2, s2, 128)
-    d4 = decoder_block(d3, s1, 64)
+        self.decoder1 = DecoderBlock(512, 512, 512)
+        self.decoder2 = DecoderBlock(512, 256, 256)
+        self.decoder3 = DecoderBlock(256, 128, 128)
+        self.decoder4 = DecoderBlock(128, 64, 64)
 
-    outputs = tf.keras.layers.Conv2D(
-        num_classes,
-        1,
-        padding="same",
-        activation="sigmoid",
-    )(d4)
+        self.final_conv = nn.Conv2d(64, num_classes, kernel_size=1)
+        self.activation = nn.Sigmoid()
 
-    return tf.keras.Model(inputs, outputs, name="VGG19_U-Net")
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        skip1 = skip2 = skip3 = skip4 = None
+        for idx, layer in enumerate(self.encoder):
+            x = layer(x)
+            if idx == 3:
+                skip1 = x
+            elif idx == 8:
+                skip2 = x
+            elif idx == 17:
+                skip3 = x
+            elif idx == 26:
+                skip4 = x
+        bridge = x
+
+        if skip4 is None or skip3 is None or skip2 is None or skip1 is None:
+            raise RuntimeError("VGG19 encoder did not produce expected skip connections.")
+
+        x = self.decoder1(bridge, skip4)
+        x = self.decoder2(x, skip3)
+        x = self.decoder3(x, skip2)
+        x = self.decoder4(x, skip1)
+        x = self.final_conv(x)
+        return self.activation(x)
+
+
+def build_vgg19_unet(input_shape: Tuple[int, int, int], num_classes: int) -> nn.Module:
+    return VGG19UNet(num_classes)
